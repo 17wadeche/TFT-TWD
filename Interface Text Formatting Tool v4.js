@@ -470,7 +470,7 @@ function deepFindAnchorsInRow(rowEl) {
 async function openSourceInfoByRowIndex(rowIndex) {
   const grids = findSourceInfosGrids();
   const grid = grids[0];
-  if (!grid) { dlog("No Source Info grid found when trying to open row", rowIndex); return false; }
+  if (!grid) { dlog("No Source Info grid found when trying to open row", rowIndex); return { ok:false, href:null }; }
   let rowEl = grid.querySelector(`[role="row"][aria-rowindex="${rowIndex}"]`);
   if (!rowEl) {
     let count = 0, hit = null;
@@ -482,18 +482,18 @@ async function openSourceInfoByRowIndex(rowIndex) {
     });
     rowEl = hit;
   }
-  if (!rowEl) { dlog("Row not found for index", rowIndex); return false; }
+  if (!rowEl) { dlog("Row not found for index", rowIndex); return { ok:false, href:null }; }
   const a = getSourceInfoAnchorInRow(rowEl);
-  if (!a) { dlog("No anchor in row", rowIndex); return false; }
-  const href = a.getAttribute('href') || a.href;
+  if (!a) { dlog("No anchor in row", rowIndex); return { ok:false, href:null }; }
+  const href = a.getAttribute('href') || a.href || null;
   dlog("Clicking Source Info row", rowIndex, "href:", href, "text:", (a.textContent||'').trim());
   safeClick(a);
-  const ok = await waitFor(
+  const ok = !!(await waitFor(
     () => /\/lightning\/r\//i.test(location.href) || document.querySelector('records-record-layout-item'),
     { timeout: 12000 }
-  );
+  ));
   dlog("Navigation after click", ok ? "ok" : "timeout");
-  return !!ok;
+  return { ok, href };
 }
 function getSourceInfoAnchorInRow(rowEl) {
   const anchors = deepFindAnchorsInRow(rowEl);
@@ -736,10 +736,10 @@ function extractRichInnerHTMLFrom(hostOrPair) {
   for (let i = 0; i < toVisit.length; i++) {
     const idx = toVisit[i];
     dlog(`Row ${i+1}/${toVisit.length} -> opening rowIndex ${idx}`);
-    const opened = await openSourceInfoByRowIndex(idx);
-    if (!opened) { dwarn("Open failed for rowIndex", idx); continue; }
+    const { ok, href } = await openSourceInfoByRowIndex(idx);
+    if (!ok) { dwarn("Open failed for rowIndex", idx); continue; }
     const full = await readSourceInfoFromDetails();
-    gathered.push({ rowIndex: idx, html: full.html, text: full.text });
+    gathered.push({ rowIndex: idx, href: href || null, html: full.html, text: full.text });
     history.back();
     const backOk = await waitFor(() => findSourceInfosGrids().length > 0, { timeout: 12000 });
     if (!backOk) {
@@ -750,6 +750,26 @@ function extractRichInnerHTMLFrom(hostOrPair) {
     await (ensureOnTab('Source Info') || ensureOnTab('Source Information'));
   }
   dlog("Collected source info records:", gathered.length);
+  for (const g of gathered) {
+    let r = g.href ? rows.find(x => (x.recordHref && x.recordHref === g.href)) : null;
+    if (!r) r = rows.find(x => x.rowIndex === g.rowIndex);
+    if (r) {
+      if (g.html && g.html.trim()) {
+        r.sourceHtml = g.html;   // prefer rich HTML
+        r.sourceText = "";
+      } else if (g.text && g.text.trim()) {
+        r.sourceText = g.text;
+      }
+    } else {
+      rows.push({
+        rowIndex: g.rowIndex,
+        recordHref: g.href || null,
+        sourceHtml: g.html || "",
+        sourceText: g.text || "",
+        add: false
+      });
+    }
+  }
   const srcRows = rows.filter(r => (r.sourceText || r.sourceHtml) && !r.add);
   const flaggedRows = rows.filter(r => r.add && (r.sourceText || r.sourceHtml));
   dlog("Rows with Source Info:", srcRows.length, "flagged:", flaggedRows.length);
@@ -768,12 +788,9 @@ function extractRichInnerHTMLFrom(hostOrPair) {
   }
   function addRowContent(r, sectionTitle, lines, links, styleWords, boldLinesKeyWords) {
     if (r.sourceHtml && r.sourceHtml.trim()) {
-      const pre = richToPreText(r.sourceHtml);
-      const escaped = pre
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
-      lines.push(`<pre class="from-pre">${escaped}</pre>`);
+      const cleaned = sanitizeRichHTML(r.sourceHtml);
+      dlog("[IF] html preview:", JSON.stringify(cleaned.slice(0, 220)));
+      lines.push(`<div class="from-rich">${cleaned}</div>`);
     } else if (r.sourceText) {
       const ft = formatText(r.sourceText, sectionTitle, styleWords, boldLinesKeyWords, applyCombinedStyles);
       lines.push(...ft.lines);
