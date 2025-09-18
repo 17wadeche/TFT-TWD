@@ -125,45 +125,62 @@ function findValueByLabel(labelRegex) {
 }
 async function readSourceInfoFromDetails() {
   dlog('readSourceInfoFromDetails: ensure Details tab');
-  await ensureOnTab('Details', { timeout: 15000 });
+  await ensureOnTab('Details', { timeout: 20000 });
+  await waitFor(
+    () => document.querySelector('records-record-layout-item') || document.querySelector('.CMPL123TextAreaRichField'),
+    { timeout: 12000, label: 'wait layout' }
+  );
+  const progressiveScroll = async () => {
+    const steps = [200, 700, 1300, 2000, 2800, 3600];
+    for (const y of steps) {
+      try { window.scrollTo(0, y); } catch(_) {}
+      await new Promise(r => setTimeout(r, 250));
+    }
+    try { window.scrollTo(0, 0); } catch(_) {}
+    await new Promise(r => setTimeout(r, 200));
+  };
   forceExpandCMPL123Sections();
-  await new Promise(r => setTimeout(r, 150));
+  await progressiveScroll();
   let pair = await waitFor(
     () => findCmpl123RichByLabel(/^\s*Source Information\s*$/i),
-    { timeout: 6000 }
+    { timeout: 10000, label: 'find CMPL123 primary' }
   );
   if (!pair) {
-    window.scrollBy(0, 600);
-    await new Promise(r => setTimeout(r, 200));
+    window.scrollBy(0, 800);
+    await new Promise(r => setTimeout(r, 300));
     pair = await waitFor(
       () => findCmpl123RichByLabel(/^\s*Source Information\s*$/i),
-      { timeout: 3000 }
+      { timeout: 6000, label: 'find CMPL123 retry' }
     );
   }
   let html = extractRichInnerHTMLFrom(pair);
-  if (!html || !html.trim()) {
-    dlog('[IF] primary label empty or not found, checking Local Language…');
-    const llPair = await waitFor(
-      () => findCmpl123RichByLabel(/^\s*Source Information\s*\(Local Language\)\s*$/i),
-      { timeout: 4000 }
-    );
-    const llHtml = extractRichInnerHTMLFrom(llPair);
-    if (llHtml && llHtml.trim()) {
-      dlog('[IF] Local Language rich hit, length:', llHtml.length);
-      return { html: llHtml, text: "" };
-    }
-  } else {
+  if (html && html.trim()) {
     dlog('[IF] CMPL123 primary rich hit, length:', html.length);
     return { html, text: "" };
   }
+  dlog('[IF] primary empty; checking Local Language…');
+  const llPair = await waitFor(
+    () => findCmpl123RichByLabel(/^\s*Source Information\s*\(Local Language\)\s*$/i),
+    { timeout: 8000, label: 'find CMPL123 local lang' }
+  );
+  const llHtml = extractRichInnerHTMLFrom(llPair);
+  if (llHtml && llHtml.trim()) {
+    dlog('[IF] Local Language rich hit, length:', llHtml.length);
+    return { html: llHtml, text: "" };
+  }
   dlog('[IF] CMPL123 selectors failed; falling back to generic label…');
-  const labeled = await waitFor(() => findValueByLabel(/^\s*Source\s*Information\s*$/i), { timeout: 3000 });
+  await progressiveScroll();
+  const labeled = await waitFor(
+    () => findValueByLabel(/^\s*Source\s*Information\s*$/i),
+    { timeout: 10000, label: 'find generic label' }
+  );
   if (labeled) {
     if (labeled.type === 'rich') {
       const raw = labeled.html || labeled.node?.innerHTML || '';
-      return { html: raw, text: "" };
+      if (raw && raw.trim()) return { html: raw, text: "" };
     }
-    return { html: "", text: pullText(labeled.node) };
+    const txt = pullText(labeled.node);
+    if (txt && txt.trim()) return { html: "", text: txt };
   }
   return { html: "", text: "" };
 }
@@ -489,8 +506,11 @@ async function openSourceInfoByRowIndex(rowIndex) {
   dlog("Clicking Source Info row", rowIndex, "href:", href, "text:", (a.textContent||'').trim());
   safeClick(a);
   const ok = !!(await waitFor(
-    () => /\/lightning\/r\//i.test(location.href) || document.querySelector('records-record-layout-item'),
-    { timeout: 12000 }
+    () =>
+      /\/lightning\/r\//i.test(location.href) ||
+      document.querySelector('.CMPL123TextAreaRichField lightning-formatted-rich-text') ||
+      document.querySelector('records-record-layout-item'),
+    { timeout: 16000, label: 'wait record nav' }
   ));
   dlog("Navigation after click", ok ? "ok" : "timeout");
   return { ok, href };
@@ -643,6 +663,16 @@ function richToPreText(html) {
 }
 function findCmpl123RichByLabel(labelRe) {
   const root = top?.document || document;
+  const pickInner = (host) => {
+    if (!host) return null;
+    const light = host.querySelector('span[part="formatted-rich-text"], .slds-rich-text-editor__output');
+    if (light) return { host, inner: light };
+    const sh1 = host.shadowRoot?.querySelector('span[part="formatted-rich-text"]');
+    if (sh1) return { host, inner: sh1 };
+    const sh2 = host.shadowRoot?.querySelector('.slds-rich-text-editor__output');
+    if (sh2) return { host, inner: sh2 };
+    return { host, inner: null };
+  };
   for (const r of allRoots(root)) {
     try {
       const blocks = r.querySelectorAll('.CMPL123TextAreaRichField .slds-form-element_readonly');
@@ -650,21 +680,14 @@ function findCmpl123RichByLabel(labelRe) {
         const labelEl = b.querySelector('.slds-form-element__label');
         const labelTxt = (labelEl?.textContent || '').trim();
         if (!labelRe.test(labelTxt)) continue;
-        const host = b.querySelector(
-          '.slds-form-element__control .slds-form-element__static lightning-formatted-rich-text,' +
-          '.slds-form-element__control .slds-form-element__static lightning-output-rich-text,'  +
-          '.slds-form-element__control .slds-form-element__static lightning-base-formatted-rich-text'
-        );
-        if (!host) continue;
-        const inner =
-          host.querySelector('span[part="formatted-rich-text"]') ||
-          host.querySelector('.slds-rich-text-editor__output') ||
-          host.shadowRoot?.querySelector('span[part="formatted-rich-text"]') ||
-          host.shadowRoot?.querySelector('.slds-rich-text-editor__output');
+        const host =
+          b.querySelector('.slds-form-element__control .slds-form-element__static lightning-formatted-rich-text') ||
+          b.querySelector('.slds-form-element__control .slds-form-element__static lightning-output-rich-text') ||
+          b.querySelector('.slds-form-element__control .slds-form-element__static lightning-base-formatted-rich-text');
 
-        return { host, inner };
+        if (host) return pickInner(host);
       }
-    } catch(_) {}
+    } catch (_) {}
   }
   return null;
 }
@@ -672,15 +695,19 @@ function extractRichInnerHTMLFrom(hostOrPair) {
   if (!hostOrPair) return '';
   const host = hostOrPair.host ?? hostOrPair;
   const inner = hostOrPair.inner ?? null;
+  const tryGet = (scope) => {
+    if (!scope) return '';
+    const a = scope.querySelector?.('span[part="formatted-rich-text"]');
+    if (a?.innerHTML) return a.innerHTML;
+    const b = scope.querySelector?.('.slds-rich-text-editor__output');
+    if (b?.innerHTML) return b.innerHTML;
+    return scope.innerHTML || '';
+  };
   if (inner?.innerHTML) return inner.innerHTML;
-  const inHost =
-    host.querySelector('span[part="formatted-rich-text"]') ||
-    host.querySelector('.slds-rich-text-editor__output');
-  if (inHost?.innerHTML) return inHost.innerHTML;
-  const inShadow =
-    host.shadowRoot?.querySelector('span[part="formatted-rich-text"]') ||
-    host.shadowRoot?.querySelector('.slds-rich-text-editor__output');
-  if (inShadow?.innerHTML) return inShadow.innerHTML;
+  const light = tryGet(host);
+  if (light) return light;
+  const shadow = tryGet(host.shadowRoot);
+  if (shadow) return shadow;
   return host.innerHTML || '';
 }
 (async function run() {
@@ -786,14 +813,78 @@ function extractRichInnerHTMLFrom(hostOrPair) {
   function escapeRegExp(str) {
     return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
+  function styleWordsInRichHTML(html, styleRules) {
+    if (!html || !styleRules || !styleRules.length) return html;
+    const tpl = document.createElement("template");
+    tpl.innerHTML = html;
+    const matchers = [];
+    for (const rule of styleRules) {
+      const words = (rule.words || []).filter(Boolean);
+      if (!words.length) continue;
+      words.sort((a,b) => b.length - a.length);
+      const parts = words.map(w => {
+        const esc = w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        return /\s/.test(w) ? esc : `\\b${esc}\\b`;
+      });
+      matchers.push({ regex: new RegExp(parts.join("|"), "gi"), style: rule.style });
+    }
+    if (!matchers.length) return html;
+    const walker = document.createTreeWalker(tpl.content, NodeFilter.SHOW_TEXT, null);
+    const textNodes = [];
+    let n;
+    while ((n = walker.nextNode())) {
+      if ((n.nodeValue || "").trim()) textNodes.push(n);
+    }
+    for (const node of textNodes) {
+      const original = node.nodeValue;
+      let chunks = [{ text: original, styles: [] }];
+      for (const { regex, style } of matchers) {
+        const nextChunks = [];
+        for (const ch of chunks) {
+          if (!ch.text) { nextChunks.push(ch); continue; }
+          let lastIdx = 0;
+          let m;
+          regex.lastIndex = 0;
+          while ((m = regex.exec(ch.text)) !== null) {
+            if (m.index > lastIdx) {
+              nextChunks.push({ text: ch.text.slice(lastIdx, m.index), styles: ch.styles.slice() });
+            }
+            nextChunks.push({ text: m[0], styles: ch.styles.concat(style) });
+            lastIdx = m.index + m[0].length;
+          }
+          if (lastIdx < ch.text.length) {
+            nextChunks.push({ text: ch.text.slice(lastIdx), styles: ch.styles.slice() });
+          }
+        }
+        chunks = nextChunks;
+      }
+      if (chunks.length === 1 && chunks[0].styles.length === 0) continue;
+      const frag = document.createDocumentFragment();
+      for (const ch of chunks) {
+        if (!ch.text) continue;
+        if (ch.styles.length) {
+          const span = document.createElement("span");
+          span.setAttribute("style", ch.styles.join(";"));
+          span.textContent = ch.text;
+          frag.appendChild(span);
+        } else {
+          frag.appendChild(document.createTextNode(ch.text));
+        }
+      }
+      node.parentNode.replaceChild(frag, node);
+    }
+    return tpl.innerHTML;
+  }
   function addRowContent(r, sectionTitle, lines, links, styleWords, boldLinesKeyWords) {
     if (r.sourceHtml && r.sourceHtml.trim()) {
-      const cleaned = sanitizeRichHTML(r.sourceHtml);
+      let cleaned = sanitizeRichHTML(r.sourceHtml);
+      cleaned = styleWordsInRichHTML(cleaned, styleWords || []);
       dlog("[IF] html preview:", JSON.stringify(cleaned.slice(0, 220)));
       lines.push(`<div class="from-rich">${cleaned}</div>`);
     } else if (r.sourceText) {
       const ft = formatText(r.sourceText, sectionTitle, styleWords, boldLinesKeyWords, applyCombinedStyles);
-      lines.push(...ft.lines);
+      const preBody = ft.lines.join("\n");
+      lines.push(`<div class="from-pre">${preBody}</div>`);
       links.push(...ft.links);
     }
   }
