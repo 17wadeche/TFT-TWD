@@ -124,95 +124,50 @@ function findValueByLabel(labelRegex) {
   return null;
 }
 async function readSourceInfoFromDetails() {
-  dlog("readSourceInfoFromDetails: ensure Details tab");
-  await ensureOnTab('Details', { timeout: 10000 });
-  const labeled = await waitFor(
-    () => findValueByLabel(/^\s*Source\s*Information\s*$/i),
-    { timeout: 6000, label: "waitFor(Source Information field)" }
+  dlog('readSourceInfoFromDetails: ensure Details tab');
+  await ensureOnTab('Details', { timeout: 15000 });
+  forceExpandCMPL123Sections();
+  await new Promise(r => setTimeout(r, 150));
+  let pair = await waitFor(
+    () => findCmpl123RichByLabel(/^\s*Source Information\s*$/i),
+    { timeout: 6000 }
   );
+  if (!pair) {
+    window.scrollBy(0, 600);
+    await new Promise(r => setTimeout(r, 200));
+    pair = await waitFor(
+      () => findCmpl123RichByLabel(/^\s*Source Information\s*$/i),
+      { timeout: 3000 }
+    );
+  }
+  let html = extractRichInnerHTMLFrom(pair);
+  if (!html || !html.trim()) {
+    dlog('[IF] primary label empty or not found, checking Local Language…');
+    const llPair = await waitFor(
+      () => findCmpl123RichByLabel(/^\s*Source Information\s*\(Local Language\)\s*$/i),
+      { timeout: 4000 }
+    );
+    const llHtml = extractRichInnerHTMLFrom(llPair);
+    if (llHtml && llHtml.trim()) {
+      dlog('[IF] Local Language rich hit, length:', llHtml.length);
+      return { html: llHtml, text: "" };
+    }
+  } else {
+    dlog('[IF] CMPL123 primary rich hit, length:', html.length);
+    return { html, text: "" };
+  }
+  dlog('[IF] CMPL123 selectors failed; falling back to generic label…');
+  const labeled = await waitFor(() => findValueByLabel(/^\s*Source\s*Information\s*$/i), { timeout: 3000 });
   if (labeled) {
     if (labeled.type === 'rich') {
-      const raw = labeled.html || labeled.node.innerHTML || '';
-      const clean = sanitizeRichHTML(raw);
-      dlog("readSourceInfoFromDetails -> RICH length:", clean.length);
-      return { html: clean, text: "" };
-    } else {
-      const text = pullText(labeled.node);
-      dlog("readSourceInfoFromDetails -> TEXT length:", text.length);
-      dlog("readSourceInfoFromDetails -> nothing found");
-      return { html: "", text };
+      const raw = labeled.html || labeled.node?.innerHTML || '';
+      return { html: raw, text: "" };
     }
-  }
-  dwarn("readSourceInfoFromDetails: labeled not found, trying fallback scans");
-  const root = top?.document || document;
-  const tryGetInner = (el) => {
-    try {
-      if (!el) return '';
-      if (el.innerHTML && /<\w+/i.test(el.innerHTML)) return el.innerHTML;
-      if (el.shadowRoot) {
-        const out =
-          el.shadowRoot.querySelector('.slds-rich-text-editor__output') ||
-          el.shadowRoot.querySelector('div, span');
-        if (out && out.innerHTML) return out.innerHTML;
-      }
-    } catch(_) {}
-    return el?.innerHTML || '';
-  };
-  for (const r of allRoots(root)) {
-    try {
-      const container = r.querySelector('records-record-layout-item, records-highlights-details, forcegenerated-adg-rollup_component__recordlayout2');
-      if (!container) continue;
-      const rich = container.querySelector(
-        'lightning-formatted-rich-text, lightning-output-rich-text, lightning-base-formatted-rich-text'
-      );
-      if (rich) {
-        const raw = tryGetInner(rich);
-        if (raw) return { html: sanitizeRichHTML(raw), text: "" };
-      }
-    } catch(_) {}
-  }
-  for (const r of allRoots(root)) {
-    try {
-      const txt = r.querySelector('lightning-base-formatted-text, lightning-formatted-text, [data-output-element-id="output-field"]');
-      if (txt) return { html: "", text: pullText(txt) };
-    } catch(_) {}
+    return { html: "", text: pullText(labeled.node) };
   }
   return { html: "", text: "" };
 }
-async function navigateTo(href) {
-  dlog("navigateTo:", href);
-  try { 
-    const a = document.createElement('a');
-    a.href = href;
-    const want = a.href;
-    if (location.href !== want) location.assign(want);
-    else safeClick(a); // fallback
-  } catch(_) { location.assign(href); }
-  const ok = await waitFor(
-    () => /lightning\/r\//i.test(location.href) || document.querySelector('records-record-layout-item'),
-    { timeout: 12000, label: "waitFor(record page)" }
-  );
-  dlog("navigateTo ok?", !!ok, "current:", location.href);
-  return !!ok;
-}
 let __LIST_URL__ = null;
-async function goBackToSourceInfoTab() {
-  if (__LIST_URL__) {
-    dlog("goBack: using stored list url:", __LIST_URL__);
-    location.assign(__LIST_URL__);
-  } else {
-    dlog("goBack: using history.back()");
-    history.back();
-  }
-  await waitFor(() => findSourceInfosGrids().length > 0, { timeout: 12000, label: "waitFor(grid after back)" });
-  const onTab = await ensureOnTab('Source Info') || await ensureOnTab('Source Information');
-  dlog("ensureOnTab(Source Info) ->", !!onTab);
-}
-async function goBackToSourceInfoTab() {
-  history.back();
-  await waitFor(() => findSourceInfosGrids().length > 0, { timeout: 12000 });
-  await ensureOnTab('Source Info') || await ensureOnTab('Source Information');
-}
 function queryDeepForLink(rootNode) {
   for (const n of allRoots(rootNode)) {
     try {
@@ -502,6 +457,54 @@ function sanitizeRichHTML(html) {
     .replace(/\r\n/g, "\n")      // normalize
     .replace(/\n{3,}/g, "\n\n"); // compact big gaps
 }
+function deepFindAnchorsInRow(rowEl) {
+  const anchors = [];
+  for (const scope of allRoots(rowEl)) {
+    try {
+      const as = scope.querySelectorAll ? scope.querySelectorAll('a[href]') : [];
+      as && anchors.push(...Array.from(as));
+    } catch(_) {}
+  }
+  return anchors;
+}
+async function openSourceInfoByRowIndex(rowIndex) {
+  const grids = findSourceInfosGrids();
+  const grid = grids[0];
+  if (!grid) { dlog("No Source Info grid found when trying to open row", rowIndex); return false; }
+  let rowEl = grid.querySelector(`[role="row"][aria-rowindex="${rowIndex}"]`);
+  if (!rowEl) {
+    let count = 0, hit = null;
+    grid.querySelectorAll('[role="row"]').forEach(r => {
+      const hasCells = r.querySelectorAll('td[role="gridcell"]').length > 0;
+      if (!hasCells) return;
+      count += 1;
+      if (count === rowIndex) hit = r;
+    });
+    rowEl = hit;
+  }
+  if (!rowEl) { dlog("Row not found for index", rowIndex); return false; }
+  const a = getSourceInfoAnchorInRow(rowEl);
+  if (!a) { dlog("No anchor in row", rowIndex); return false; }
+  const href = a.getAttribute('href') || a.href;
+  dlog("Clicking Source Info row", rowIndex, "href:", href, "text:", (a.textContent||'').trim());
+  safeClick(a);
+  const ok = await waitFor(
+    () => /\/lightning\/r\//i.test(location.href) || document.querySelector('records-record-layout-item'),
+    { timeout: 12000 }
+  );
+  dlog("Navigation after click", ok ? "ok" : "timeout");
+  return !!ok;
+}
+function getSourceInfoAnchorInRow(rowEl) {
+  const anchors = deepFindAnchorsInRow(rowEl);
+  let a = anchors.find(a => /SourceInfo-\d{3,}/i.test((a.textContent || '').trim()));
+  if (a) return a;
+  a = anchors.find(a => /\/lightning\/r\/a5A\w+\/view/i.test(a.getAttribute('href') || a.href || ''));
+  if (a) return a;
+  a = anchors.find(a => a.closest && a.closest('records-hoverable-link'));
+  if (a) return a;
+  return anchors[0] || null;
+}
 function formatText(text, txtType, styleWords, boldLinesKeyWords, applyCombinedStylesFn) {
   text = text.replace(/\r\n|\r/g, "\n");
   text = text.replace(/(?<!\*)\*(?!\*)/g, "\n*");
@@ -595,6 +598,91 @@ function findSourceInfoLinkInRow(rowEl) {
   dwarn("No Source Info link found in row.");
   return null;
 }
+function forceExpandCMPL123Sections() {
+  let opened = 0;
+  const root = top?.document || document;
+  for (const r of allRoots(root)) {
+    try {
+      r.querySelectorAll('.CMPL123RecordDetailSection').forEach(sec => {
+        if (!sec.classList.contains('slds-is-open')) {
+          const header = sec.querySelector('.slds-section__title, button[aria-controls], .slds-section');
+          try { header?.click(); opened++; } catch(_) {}
+        }
+      });
+    } catch(_) {}
+  }
+  dlog('[IF] forceExpandCMPL123Sections opened:', opened);
+}
+function richToPreText(html) {
+  if (!html) return "";
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  let out = [];
+  const walk = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      out.push(node.nodeValue.replace(/\u00A0/g, " "));
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const tag = node.tagName;
+    if (tag === "BR") {
+      out.push("\n");
+      return;
+    }
+    for (const ch of Array.from(node.childNodes)) walk(ch);
+    if (
+      tag === "P" || tag === "DIV" || tag === "SECTION" || tag === "ARTICLE" ||
+      /^H[1-6]$/.test(tag) || tag === "LI"
+    ) {
+      out.push("\n");
+    }
+  };
+  walk(tpl.content);
+  let text = out.join("").replace(/\r\n/g, "\n");
+  return text;
+}
+function findCmpl123RichByLabel(labelRe) {
+  const root = top?.document || document;
+  for (const r of allRoots(root)) {
+    try {
+      const blocks = r.querySelectorAll('.CMPL123TextAreaRichField .slds-form-element_readonly');
+      for (const b of blocks) {
+        const labelEl = b.querySelector('.slds-form-element__label');
+        const labelTxt = (labelEl?.textContent || '').trim();
+        if (!labelRe.test(labelTxt)) continue;
+        const host = b.querySelector(
+          '.slds-form-element__control .slds-form-element__static lightning-formatted-rich-text,' +
+          '.slds-form-element__control .slds-form-element__static lightning-output-rich-text,'  +
+          '.slds-form-element__control .slds-form-element__static lightning-base-formatted-rich-text'
+        );
+        if (!host) continue;
+        const inner =
+          host.querySelector('span[part="formatted-rich-text"]') ||
+          host.querySelector('.slds-rich-text-editor__output') ||
+          host.shadowRoot?.querySelector('span[part="formatted-rich-text"]') ||
+          host.shadowRoot?.querySelector('.slds-rich-text-editor__output');
+
+        return { host, inner };
+      }
+    } catch(_) {}
+  }
+  return null;
+}
+function extractRichInnerHTMLFrom(hostOrPair) {
+  if (!hostOrPair) return '';
+  const host = hostOrPair.host ?? hostOrPair;
+  const inner = hostOrPair.inner ?? null;
+  if (inner?.innerHTML) return inner.innerHTML;
+  const inHost =
+    host.querySelector('span[part="formatted-rich-text"]') ||
+    host.querySelector('.slds-rich-text-editor__output');
+  if (inHost?.innerHTML) return inHost.innerHTML;
+  const inShadow =
+    host.shadowRoot?.querySelector('span[part="formatted-rich-text"]') ||
+    host.shadowRoot?.querySelector('.slds-rich-text-editor__output');
+  if (inShadow?.innerHTML) return inShadow.innerHTML;
+  return host.innerHTML || '';
+}
 (async function run() {
   const tab = openTabEarly();
   dlog("RUN start, url:", location.href);
@@ -619,22 +707,49 @@ function findSourceInfoLinkInRow(rowEl) {
     });
   }
   const rows = await getRowwiseSourceInfoEnsured();
+  __LIST_URL__ = String(location?.href || document?.URL || "");
+  dlog("Stored list URL:", __LIST_URL__ || "(empty)");
   dlog("Stored list URL:", __LIST_URL__);
   dlog("Total rows to visit:", rows.length);
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i];
-    dlog(`Row ${i+1}/${rows.length} -> href:`, r.recordHref);
-    if (!r.recordHref) continue;
-    try {
-      const ok = await navigateTo(r.recordHref);
-      if (!ok) continue;
-      const full = await readSourceInfoFromDetails();
-      if (full.html) { r.sourceHtml = full.html; r.sourceText = ""; }
-      else if (full.text) { r.sourceText = full.text; }
-      dlog(`Row ${i+1} harvested -> html?`, !!r.sourceHtml, "text?", !!r.sourceText);
-    } catch(_) {}
-    await goBackToSourceInfoTab();
+  const LIST_URL = String(location?.href || document?.URL || "");
+  dlog("Stored list URL:", LIST_URL);
+  let toVisit = [];
+  {
+    const grids = findSourceInfosGrids();
+    dlog("findSourceInfosGrids ->", grids.length, "grid(s)");
+    if (grids[0]) {
+      const rowEls = Array.from(grids[0].querySelectorAll('[role="row"]'));
+      dlog("Scanning rows:", rowEls.length);
+      let dataRowCounter = 0;
+      rowEls.forEach(r => {
+        const hasCells = r.querySelectorAll('td[role="gridcell"]').length > 0;
+        if (!hasCells) return;
+        const ariaIdx = parseInt(r.getAttribute('aria-rowindex') || '', 10);
+        dataRowCounter += 1;
+        const rowIndex = Number.isFinite(ariaIdx) ? ariaIdx : dataRowCounter;
+        if (getSourceInfoAnchorInRow(r)) toVisit.push(rowIndex);
+      });
+    }
   }
+  dlog("Total rows with Source Info links:", toVisit.length, toVisit);
+  let gathered = [];
+  for (let i = 0; i < toVisit.length; i++) {
+    const idx = toVisit[i];
+    dlog(`Row ${i+1}/${toVisit.length} -> opening rowIndex ${idx}`);
+    const opened = await openSourceInfoByRowIndex(idx);
+    if (!opened) { dwarn("Open failed for rowIndex", idx); continue; }
+    const full = await readSourceInfoFromDetails();
+    gathered.push({ rowIndex: idx, html: full.html, text: full.text });
+    history.back();
+    const backOk = await waitFor(() => findSourceInfosGrids().length > 0, { timeout: 12000 });
+    if (!backOk) {
+      dlog("history.back() didn't restore grid, reloading list URL…");
+      location.assign(LIST_URL);
+      await waitFor(() => findSourceInfosGrids().length > 0, { timeout: 12000 });
+    }
+    await (ensureOnTab('Source Info') || ensureOnTab('Source Information'));
+  }
+  dlog("Collected source info records:", gathered.length);
   const srcRows = rows.filter(r => (r.sourceText || r.sourceHtml) && !r.add);
   const flaggedRows = rows.filter(r => r.add && (r.sourceText || r.sourceHtml));
   dlog("Rows with Source Info:", srcRows.length, "flagged:", flaggedRows.length);
@@ -653,7 +768,12 @@ function findSourceInfoLinkInRow(rowEl) {
   }
   function addRowContent(r, sectionTitle, lines, links, styleWords, boldLinesKeyWords) {
     if (r.sourceHtml && r.sourceHtml.trim()) {
-      lines.push(`<div class="from-rich">${r.sourceHtml}</div>`);
+      const pre = richToPreText(r.sourceHtml);
+      const escaped = pre
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+      lines.push(`<pre class="from-pre">${escaped}</pre>`);
     } else if (r.sourceText) {
       const ft = formatText(r.sourceText, sectionTitle, styleWords, boldLinesKeyWords, applyCombinedStyles);
       lines.push(...ft.lines);
@@ -790,6 +910,20 @@ function findSourceInfoLinkInRow(rowEl) {
     overflow-y: auto;
     box-sizing: border-box;
     z-index: 9999;
+  }
+  .from-rich,
+  .from-rich p,
+  .from-rich div,
+  .from-rich span,
+  .from-rich [part="formatted-rich-text"] {
+    white-space: break-spaces;   /* preserves spaces, tabs, and newlines */
+    line-break: anywhere;        /* avoid overflow while keeping whitespace */
+  }
+  .from-pre {
+    white-space: pre-wrap;   /* preserve newlines/tabs/spaces, allow wrapping */
+    font: inherit;           /* match the surrounding font */
+    margin: 0 0 12px 0;      /* similar spacing to your <p> stack */
+    line-height: 1.5;
   }
   .ou-pill{
     margin: 4px 0 12px 0;
