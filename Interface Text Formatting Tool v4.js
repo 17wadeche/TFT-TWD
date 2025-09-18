@@ -125,44 +125,62 @@ function findValueByLabel(labelRegex) {
 }
 async function readSourceInfoFromDetails() {
   dlog('readSourceInfoFromDetails: ensure Details tab');
-  await ensureOnTab('Details', { timeout: 15000 });
+  await ensureOnTab('Details', { timeout: 20000 });
+  await waitFor(() => document.querySelector('records-record-layout-item'), { timeout: 8000 });
   forceExpandCMPL123Sections();
-  await new Promise(r => setTimeout(r, 150));
+  await new Promise(r => setTimeout(r, 250));
+  for (let i = 0; i < 4; i++) {
+    window.scrollBy(0, 900);
+    await new Promise(r => setTimeout(r, 250));
+  }
+  window.scrollTo(0, 0);
   let pair = await waitFor(
     () => findCmpl123RichByLabel(/^\s*Source Information\s*$/i),
-    { timeout: 6000 }
+    { timeout: 12000 }
   );
   if (!pair) {
-    window.scrollBy(0, 600);
-    await new Promise(r => setTimeout(r, 200));
+    window.scrollBy(0, 1200);
+    await new Promise(r => setTimeout(r, 350));
     pair = await waitFor(
       () => findCmpl123RichByLabel(/^\s*Source Information\s*$/i),
-      { timeout: 3000 }
+      { timeout: 6000 }
     );
   }
   let html = extractRichInnerHTMLFrom(pair);
-  if (!html || !html.trim()) {
-    dlog('[IF] primary label empty or not found, checking Local Language…');
-    const llPair = await waitFor(
-      () => findCmpl123RichByLabel(/^\s*Source Information\s*\(Local Language\)\s*$/i),
-      { timeout: 4000 }
-    );
-    const llHtml = extractRichInnerHTMLFrom(llPair);
-    if (llHtml && llHtml.trim()) {
-      dlog('[IF] Local Language rich hit, length:', llHtml.length);
-      return { html: llHtml, text: "" };
-    }
-  } else {
+  if (html && html.trim()) {
     dlog('[IF] CMPL123 primary rich hit, length:', html.length);
     return { html, text: "" };
   }
-  dlog('[IF] CMPL123 selectors failed; falling back to generic label…');
-  const labeled = await waitFor(() => findValueByLabel(/^\s*Source\s*Information\s*$/i), { timeout: 3000 });
+  dlog('[IF] primary empty; checking Local Language…');
+  const llPair = await waitFor(
+    () => findCmpl123RichByLabel(/^\s*Source Information\s*\(Local Language\)\s*$/i),
+    { timeout: 6000 }
+  );
+  const llHtml = extractRichInnerHTMLFrom(llPair);
+  if (llHtml && llHtml.trim()) {
+    dlog('[IF] Local Language rich hit, length:', llHtml.length);
+    return { html: llHtml, text: "" };
+  }
+  dlog('[IF] CMPL123 selectors failed; generic rich scan…');
+  const generic = await waitFor(() => {
+    const all = Array.from(document.querySelectorAll('*'));
+    const label = all.find(n => /^\s*Source\s*Information\s*$/i.test((n.textContent||'').trim()));
+    if (!label) return null;
+    const container = label.closest('records-record-layout-item, lightning-layout, div, section') || label.parentElement;
+    if (!container) return null;
+    const rich = container.querySelector('lightning-formatted-rich-text, lightning-output-rich-text, lightning-base-formatted-rich-text');
+    return rich ? { rich } : null;
+  }, { timeout: 6000 });
+  if (generic && generic.rich) {
+    const raw =
+      generic.rich.shadowRoot?.querySelector('.slds-rich-text-editor__output')?.innerHTML ||
+      generic.rich.querySelector('.slds-rich-text-editor__output')?.innerHTML ||
+      generic.rich.innerHTML || '';
+    if (raw && raw.trim()) return { html: raw, text: "" };
+  }
+  const labeled = await waitFor(() => findValueByLabel(/^\s*Source\s*Information\s*$/i), { timeout: 4000 });
   if (labeled) {
-    if (labeled.type === 'rich') {
-      const raw = labeled.html || labeled.node?.innerHTML || '';
-      return { html: raw, text: "" };
-    }
+    if (labeled.type === 'rich') return { html: labeled.html || labeled.node?.innerHTML || '', text: "" };
     return { html: "", text: pullText(labeled.node) };
   }
   return { html: "", text: "" };
@@ -190,7 +208,8 @@ function harvestRowsFromGrid(grid) {
     let sourceText = '';
     let sourceHtml = '';
     let add = null;
-    const recordHref = timed("findSourceInfoLinkInRow", () => findSourceInfoLinkInRow(rowEl));
+    const anchor = getSourceInfoAnchorInRow(rowEl);
+    const recordHref = anchor ? (anchor.getAttribute('href') || anchor.href || null) : null;
     cells.forEach(td => {
       const label = (td.getAttribute('data-label') || '').trim();
       const key   = (td.getAttribute('data-col-key-value') || '').trim();
@@ -203,7 +222,7 @@ function harvestRowsFromGrid(grid) {
         } else {
           const txtEl = td.querySelector('lightning-base-formatted-text, lightning-formatted-text, lst-basic-rich-text');
           const html = txtEl?.innerHTML;
-          sourceText = html ? htmlToPlain(html) : pullText(txtEl || td);
+          sourceText = html ? htmlToPlain(html) : pullText(td);
         }
       }
       if (/^additional info review$/i.test(label) || /AdditionalInfoReview/i.test(key)) {
@@ -217,7 +236,13 @@ function harvestRowsFromGrid(grid) {
   });
   dlog("harvestRowsFromGrid -> rows found:", rows.length);
   if (rows.length) {
-    console.table(rows.map(r => ({ rowIndex: r.rowIndex, hasHtml: !!r.sourceHtml, hasText: !!r.sourceText, add: !!r.add, href: r.recordHref })));
+    console.table(rows.map(r => ({
+      rowIndex: r.rowIndex,
+      hasHtml: !!r.sourceHtml,
+      hasText: !!r.sourceText,
+      add: !!r.add,
+      href: r.recordHref
+    })));
   }
   return rows;
 }
@@ -753,6 +778,7 @@ function extractRichInnerHTMLFrom(hostOrPair) {
   for (const g of gathered) {
     let r = g.href ? rows.find(x => (x.recordHref && x.recordHref === g.href)) : null;
     if (!r) r = rows.find(x => x.rowIndex === g.rowIndex);
+    dlog('[IF] merge for href/row', g.href, g.rowIndex, '->', r ? 'matched' : 'no match');
     if (r) {
       if (g.html && g.html.trim()) {
         r.sourceHtml = g.html;   // prefer rich HTML
