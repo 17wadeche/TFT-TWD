@@ -398,6 +398,59 @@ function sanitizeRichHTML(html) {
     .replace(/\r\n/g, "\n")      // normalize
     .replace(/\n{3,}/g, "\n\n"); // compact big gaps
 }
+function formatText(text, txtType, styleWords, boldLinesKeyWords, applyCombinedStylesFn) {
+  text = text.replace(/\r\n|\r/g, "\n");
+  text = text.replace(/(?<!\*)\*(?!\*)/g, "\n*");
+  text = text.replace(/-###-From (SR|PE)-/g, "\n$&");
+  const linesArr = text.split("\n").filter(l => l.trim().length > 0);
+  const DATE_RE = /(\b(?:\d{4}[-/.](?:\d{1,2}|[A-Za-z]{3})[-/.]\d{1,2}|(?:\d{1,2}[-/ ](?:[A-Za-z]{3,9})[-/ ]\d{4})|(?:[A-Za-z]{3,9} \d{1,2}, \d{4})|(?:\d{1,2}[-/]\d{1,2}[-/]\d{4}))(?: \d{1,2}:\d{2}(?::\d{2})?(?: ?[APap][Mm])?)?\b)/;
+  let localLinks = [];
+  let startLine = 0;
+  let linkIdCounter = 0;
+  const newLinesArr = [];
+  linesArr.forEach((l, lineNo) => {
+    l = l.replace(/\s+$/, "");
+    l = l.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const dateMatch = l.match(DATE_RE);
+    const hasDate = !!dateMatch;
+    if (hasDate) {
+      const dateStr = dateMatch[0];
+      l = `<span style="position: relative;" id="lnk${linkIdCounter}">
+             <span class="arrowPointer" id="lnk${linkIdCounter}-arrow">&#x2192;</span>${l}
+           </span>`;
+      if (txtType === "General") {
+        localLinks.push({ id:`lnk${linkIdCounter}`, title:dateStr, level:1, start:startLine, end:lineNo });
+        startLine = lineNo + 1;
+      } else {
+        if (localLinks.length > 0) localLinks[localLinks.length - 1].end = lineNo - 1;
+        localLinks.push({ id:`lnk${linkIdCounter}`, title:dateStr, level:1, start:lineNo, end:null });
+      }
+      linkIdCounter++;
+    }
+    (boldLinesKeyWords || []).forEach(kw => {
+      if (!hasDate && l.indexOf(kw) >= 0) {
+        l = `<span style="position: relative;" id="lnk${linkIdCounter}">
+               <span class="arrowPointer" id="lnk${linkIdCounter}-arrow">&#x2192;</span>${l}
+             </span>`;
+        localLinks.push({ id:`lnk${linkIdCounter}`, title:kw, level:1, start:lineNo, end:lineNo });
+        linkIdCounter++;
+      }
+    });
+    l = (applyCombinedStylesFn || applyCombinedStyles)(l, styleWords || []);
+    newLinesArr.push(l);
+  });
+  if (localLinks.length > 0 && txtType !== "General") {
+    localLinks[localLinks.length - 1].end = newLinesArr.length - 1;
+    startLine = newLinesArr.length;
+  }
+  if (localLinks.length === 0) return { lines: newLinesArr, links: [] };
+  const LinksSorted = localLinks.concat().sort((a, b) => {
+    const dateA = new Date(a.title); const dateB = new Date(b.title);
+    if (isNaN(dateA) || isNaN(dateB)) return a.title.localeCompare(b.title);
+    return dateA - dateB;
+  });
+  return { lines: newLinesArr, links: LinksSorted };
+}
 async function getOUEnsured(){
   let ou = getOUFromPage();
   if (ou) return ou;
@@ -439,9 +492,8 @@ async function getOUEnsured(){
     } catch(_) {}
     await goBackToSourceInfoTab();
   }
-  const srcRows = rows.filter(r => r.sourceText && !r.add);
-  const flaggedRows = rows.filter(r => r.add && r.sourceText);
-  const flaggedRowsNoSrc = rows.filter(r => r.add && !r.sourceText);
+  const srcRows = rows.filter(r => (r.sourceText || r.sourceHtml) && !r.add);
+  const flaggedRows = rows.filter(r => r.add && (r.sourceText || r.sourceHtml));
   const recordId = (await getRecordIdSmart()) || "Record";
   if (originalTab) {
     if (!(await ensureOnTab(originalTab))) {
@@ -454,6 +506,15 @@ async function getOUEnsured(){
   }
   function escapeRegExp(str) {
     return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  function addRowContent(r, sectionTitle, lines, links, styleWords, boldLinesKeyWords) {
+    if (r.sourceHtml && r.sourceHtml.trim()) {
+      lines.push(`<div class="from-rich">${r.sourceHtml}</div>`);
+    } else if (r.sourceText) {
+      const ft = formatText(r.sourceText, sectionTitle, styleWords, boldLinesKeyWords, applyCombinedStyles);
+      lines.push(...ft.lines);
+      links.push(...ft.links);
+    }
   }
   function applyCombinedStyles(text, styleRules) {
     let events = [];
@@ -525,87 +586,6 @@ async function getOUEnsured(){
     var lines = [];
     var links = [];
     var linkIdCounter = 0;
-    function formatText(text, txtType) {
-      text = text.replace(/\r\n|\r/g, "\n");
-      text = text.replace(/(?<!\*)\*(?!\*)/g, "\n*");
-      text = text.replace(/-###-From (SR|PE)-/g, "\n$&");
-      var linesArr = text.split("\n").filter(l => l.trim().length > 0);
-      const DATE_RE = /(\b(?:\d{4}[-/.](?:\d{1,2}|[A-Za-z]{3})[-/.]\d{1,2}|(?:\d{1,2}[-/ ](?:[A-Za-z]{3,9})[-/ ]\d{4})|(?:[A-Za-z]{3,9} \d{1,2}, \d{4})|(?:\d{1,2}[-/]\d{1,2}[-/]\d{4}))(?: \d{1,2}:\d{2}(?::\d{2})?(?: ?[APap][Mm])?)?\b)/;
-      var localLinks = [];
-      var startLine = 0;
-      let newLinesArr = [];
-      linesArr.forEach(function(l, lineNo) {
-        l = l.replace(/\s+$/, "");
-        l = l.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-        const dateMatch = l.match(DATE_RE);
-        const hasDate = !!dateMatch;
-        if (hasDate) {
-          const dateStr = dateMatch[0];
-          l =
-            `<span style="position: relative;" id="lnk${linkIdCounter}">` +
-            `<span class="arrowPointer" id="lnk${linkIdCounter}-arrow">&#x2192;</span>` +
-            l +
-            `</span>`;
-          if (txtType === "General") {
-            localLinks.push({
-              id: `lnk${linkIdCounter}`,
-              title: dateStr,
-              level: 1,
-              start: startLine,
-              end: lineNo
-            });
-            startLine = lineNo + 1;
-          } else {
-            if (localLinks.length > 0) {
-              localLinks[localLinks.length - 1].end = lineNo - 1;
-            }
-            localLinks.push({
-              id: `lnk${linkIdCounter}`,
-              title: dateStr,
-              level: 1,
-              start: lineNo,
-              end: null
-            });
-          }
-          linkIdCounter++;
-        }
-        boldLinesKeyWords.forEach(kw => {
-          if (!hasDate && l.indexOf(kw) >= 0) {
-            l =
-              `<span style="position: relative;" id="lnk${linkIdCounter}">` +
-              `<span class="arrowPointer" id="lnk${linkIdCounter}-arrow">&#x2192;</span>` +
-              l +
-              `</span>`;
-            localLinks.push({
-              id: `lnk${linkIdCounter}`,
-              title: kw,
-              level: 1,
-              start: lineNo,
-              end: lineNo
-            });
-            linkIdCounter++;
-          }
-        });
-        l = applyCombinedStyles(l, styleWords);
-        newLinesArr.push(l);
-      });
-      if (localLinks.length > 0 && txtType !== "General") {
-        localLinks[localLinks.length - 1].end = newLinesArr.length - 1;
-        startLine = newLinesArr.length;
-      }
-      if (localLinks.length === 0) {
-        return { lines: newLinesArr, links: [] };
-      }
-      var LinksSorted = localLinks.concat().sort(function(a, b) {
-        var dateA = new Date(a.title);
-        var dateB = new Date(b.title);
-        if (isNaN(dateA) || isNaN(dateB)) {
-          return a.title.localeCompare(b.title);
-        }
-        return dateA - dateB;
-      });
-      return { lines: newLinesArr, links: LinksSorted };
-    }
     const recordId = (await getRecordIdSmart()) || "Record";
     const textInfoF = ["Source Information"];
     if (srcRows.length) {
@@ -613,12 +593,8 @@ async function getOUEnsured(){
       const tId = t.replace(/\W/gi, "");
       lines.push('<div class="card">');
       lines.push('<h2 id="' + tId + '"><span class="arrowPointer" id="' + tId + '-arrow">&#x2192;</span>' + t + "</h2>");
-      links.push({ id: tId, title: t }); 
-      srcRows.forEach((r) => {
-        const ft = formatText(r.sourceText, t);
-        lines = lines.concat(ft.lines);
-        ft.links.forEach(l => links.push(l));
-      });
+      links.push({ id: tId, title: t });
+      srcRows.forEach(r => addRowContent(r, t, lines, links, styleWords, boldLinesKeyWords));
       lines.push("</div>");
     }
     if (flaggedRows.length) {
@@ -626,12 +602,8 @@ async function getOUEnsured(){
       const tId = t.replace(/\W/gi, "");
       lines.push('<div class="card">');
       lines.push('<h2 id="' + tId + '"><span class="arrowPointer" id="' + tId + '-arrow">&#x2192;</span>' + t + "</h2>");
-      links.push({ id: tId, title: t }); 
-      flaggedRows.forEach((r) => {
-        const ft = formatText(r.sourceText, t);
-        lines = lines.concat(ft.lines);
-        ft.links.forEach(l => links.push(l));   
-      });
+      links.push({ id: tId, title: t });
+      flaggedRows.forEach(r => addRowContent(r, t, lines, links, styleWords, boldLinesKeyWords));
       lines.push("</div>");
     }
     var content = compactLines(lines).join("<br/>");
