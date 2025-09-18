@@ -1,5 +1,19 @@
 /* eslint semi: ["error", "always"] */
 import config from "./styles";
+const DEBUG_IF = true; // flip to false to silence logs
+const t0 = Date.now();
+const stamp = () => ((Date.now() - t0) + "ms").padStart(6, " ");
+const dlog  = (...a) => DEBUG_IF && console.log("[IF]", stamp(), ...a);
+const dwarn = (...a) => DEBUG_IF && console.warn("[IF]", stamp(), ...a);
+const derr  = (...a) => DEBUG_IF && console.error("[IF]", stamp(), ...a);
+function timed(label, fn) {
+  const start = performance.now();
+  try { return fn(); }
+  finally {
+    const ms = (performance.now() - start).toFixed(1);
+    dlog(`${label} took ${ms}ms`);
+  }
+}
 const CN_RE = /\b[A-Z]{2,4}-\d{3,}\b/;
 function* allRoots(rootDoc) {
   function* walk(node) {
@@ -70,6 +84,7 @@ function findSourceInfosGrids() {
       });
     } catch (_) {}
   }
+  dlog("findSourceInfosGrids ->", grids.size, "grid(s)");
   return Array.from(grids);
 }
 function findValueByLabel(labelRegex) {
@@ -109,19 +124,26 @@ function findValueByLabel(labelRegex) {
   return null;
 }
 async function readSourceInfoFromDetails() {
+  dlog("readSourceInfoFromDetails: ensure Details tab");
   await ensureOnTab('Details', { timeout: 10000 });
   const labeled = await waitFor(
     () => findValueByLabel(/^\s*Source\s*Information\s*$/i),
-    { timeout: 6000 }
+    { timeout: 6000, label: "waitFor(Source Information field)" }
   );
   if (labeled) {
     if (labeled.type === 'rich') {
       const raw = labeled.html || labeled.node.innerHTML || '';
-      return { html: sanitizeRichHTML(raw), text: "" };
+      const clean = sanitizeRichHTML(raw);
+      dlog("readSourceInfoFromDetails -> RICH length:", clean.length);
+      return { html: clean, text: "" };
     } else {
-      return { html: "", text: pullText(labeled.node) };
+      const text = pullText(labeled.node);
+      dlog("readSourceInfoFromDetails -> TEXT length:", text.length);
+      dlog("readSourceInfoFromDetails -> nothing found");
+      return { html: "", text };
     }
   }
+  dwarn("readSourceInfoFromDetails: labeled not found, trying fallback scans");
   const root = top?.document || document;
   const tryGetInner = (el) => {
     try {
@@ -158,6 +180,7 @@ async function readSourceInfoFromDetails() {
   return { html: "", text: "" };
 }
 async function navigateTo(href) {
+  dlog("navigateTo:", href);
   try { 
     const a = document.createElement('a');
     a.href = href;
@@ -165,8 +188,25 @@ async function navigateTo(href) {
     if (location.href !== want) location.assign(want);
     else safeClick(a); // fallback
   } catch(_) { location.assign(href); }
-  const ok = await waitFor(() => /lightning\/r\//i.test(location.href) || document.querySelector('records-record-layout-item'), { timeout: 12000 });
+  const ok = await waitFor(
+    () => /lightning\/r\//i.test(location.href) || document.querySelector('records-record-layout-item'),
+    { timeout: 12000, label: "waitFor(record page)" }
+  );
+  dlog("navigateTo ok?", !!ok, "current:", location.href);
   return !!ok;
+}
+let __LIST_URL__ = null;
+async function goBackToSourceInfoTab() {
+  if (__LIST_URL__) {
+    dlog("goBack: using stored list url:", __LIST_URL__);
+    location.assign(__LIST_URL__);
+  } else {
+    dlog("goBack: using history.back()");
+    history.back();
+  }
+  await waitFor(() => findSourceInfosGrids().length > 0, { timeout: 12000, label: "waitFor(grid after back)" });
+  const onTab = await ensureOnTab('Source Info') || await ensureOnTab('Source Information');
+  dlog("ensureOnTab(Source Info) ->", !!onTab);
 }
 async function goBackToSourceInfoTab() {
   history.back();
@@ -185,18 +225,17 @@ function queryDeepForLink(rootNode) {
 function harvestRowsFromGrid(grid) {
   const rows = [];
   const rowEls = grid.querySelectorAll('[role="row"]');
+  dlog("harvestRowsFromGrid scanning rows:", rowEls.length);
   let dataRowCounter = 0;
   rowEls.forEach(rowEl => {
     const cells = rowEl.querySelectorAll('td[role="gridcell"]');
-    if (!cells.length) return;
     const ariaIdx = parseInt(rowEl.getAttribute('aria-rowindex') || '', 10);
     dataRowCounter += 1;
     const rowIndex = Number.isFinite(ariaIdx) ? ariaIdx : dataRowCounter;
     let sourceText = '';
     let sourceHtml = '';
     let add = null;
-    let recordHref = null;
-    recordHref = findSourceInfoLinkInRow(rowEl);
+    const recordHref = timed("findSourceInfoLinkInRow", () => findSourceInfoLinkInRow(rowEl));
     cells.forEach(td => {
       const label = (td.getAttribute('data-label') || '').trim();
       const key   = (td.getAttribute('data-col-key-value') || '').trim();
@@ -221,6 +260,10 @@ function harvestRowsFromGrid(grid) {
       rows.push({ sourceText, sourceHtml, add, rowIndex, recordHref });
     }
   });
+  dlog("harvestRowsFromGrid -> rows found:", rows.length);
+  if (rows.length) {
+    console.table(rows.map(r => ({ rowIndex: r.rowIndex, hasHtml: !!r.sourceHtml, hasText: !!r.sourceText, add: !!r.add, href: r.recordHref })));
+  }
   return rows;
 }
 async function getRowwiseSourceInfoEnsured() {
@@ -363,15 +406,21 @@ function findTabByLabel(label){
   }
   return null;
 }
-function waitFor(predicate, {interval=150, timeout=4000} = {}){
+function waitFor(predicate, {interval=150, timeout=4000, label="waitFor"} = {}){
   return new Promise(resolve => {
     const start = Date.now();
     const tick = () => {
       try {
         const v = predicate();
-        if (v) return resolve(v);
-      } catch(_) {}
-      if (Date.now() - start >= timeout) return resolve(null);
+        if (v) {
+          dlog(label, "-> success");
+          return resolve(v);
+        }
+      } catch(e) { dwarn(label, "predicate threw", e); }
+      if (Date.now() - start >= timeout) {
+        dwarn(label, "-> timeout after", timeout, "ms");
+        return resolve(null);
+      }
       setTimeout(tick, interval);
     };
     tick();
@@ -515,20 +564,45 @@ async function getOUEnsured(){
   return ou || null;
 }
 function findSourceInfoLinkInRow(rowEl) {
+  const headerCell = rowEl.querySelector('th[role="rowheader"][data-label="Source Info ID"]');
+  if (headerCell) {
+    const a = headerCell.querySelector('a[href]');
+    if (a) {
+      const href = a.getAttribute('href') || a.href;
+      dlog("Row link via rowheader:", href);
+      return href;
+    }
+  }
+  const hover = rowEl.querySelector('records-hoverable-link a[href]');
+  if (hover) {
+    const href = hover.getAttribute('href') || hover.href;
+    dlog("Row link via hoverable-link:", href);
+    return href;
+  }
   const allAs = Array.from(rowEl.querySelectorAll('a[href]'));
   const byText = allAs.find(a => /SourceInfo-\d{3,}/i.test((a.textContent || '').trim()));
-  if (byText) return byText.getAttribute('href') || byText.href;
+  if (byText) {
+    const href = byText.getAttribute('href') || byText.href;
+    dlog("Row link via text match:", href);
+    return href;
+  }
   const byPrefix = allAs.find(a => /\/lightning\/r\/a5A\w+\/view/i.test(a.getAttribute('href') || a.href || ''));
-  if (byPrefix) return byPrefix.getAttribute('href') || byPrefix.href;
-  const byHoverable = rowEl.querySelector('records-hoverable-link a[href]');
-  if (byHoverable) return byHoverable.getAttribute('href') || byHoverable.href;
+  if (byPrefix) {
+    const href = byPrefix.getAttribute('href') || byPrefix.href;
+    dlog("Row link via id prefix:", href);
+    return href;
+  }
+  dwarn("No Source Info link found in row.");
   return null;
 }
 (async function run() {
   const tab = openTabEarly();
+  dlog("RUN start, url:", location.href);
   if (!tab) return;
   const originalTab = getActiveTabLabel();
+  dlog("Active tab at start:", originalTab);
   const OUKey = await getOUEnsured();
+  dlog("OUKey:", OUKey);
   const finalConfig = { styleWords: [], boldLinesKeyWords: [] };
   if (OUKey && config[OUKey]) {
     mergeConfig(finalConfig, config[OUKey]);
@@ -545,8 +619,11 @@ function findSourceInfoLinkInRow(rowEl) {
     });
   }
   const rows = await getRowwiseSourceInfoEnsured();
+  dlog("Stored list URL:", __LIST_URL__);
+  dlog("Total rows to visit:", rows.length);
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
+    dlog(`Row ${i+1}/${rows.length} -> href:`, r.recordHref);
     if (!r.recordHref) continue;
     try {
       const ok = await navigateTo(r.recordHref);
@@ -554,11 +631,13 @@ function findSourceInfoLinkInRow(rowEl) {
       const full = await readSourceInfoFromDetails();
       if (full.html) { r.sourceHtml = full.html; r.sourceText = ""; }
       else if (full.text) { r.sourceText = full.text; }
+      dlog(`Row ${i+1} harvested -> html?`, !!r.sourceHtml, "text?", !!r.sourceText);
     } catch(_) {}
     await goBackToSourceInfoTab();
   }
   const srcRows = rows.filter(r => (r.sourceText || r.sourceHtml) && !r.add);
   const flaggedRows = rows.filter(r => r.add && (r.sourceText || r.sourceHtml));
+  dlog("Rows with Source Info:", srcRows.length, "flagged:", flaggedRows.length);
   const recordId = (await getRecordIdSmart()) || "Record";
   if (originalTab) {
     if (!(await ensureOnTab(originalTab))) {
@@ -671,7 +750,7 @@ function findSourceInfoLinkInRow(rowEl) {
       flaggedRows.forEach(r => addRowContent(r, t, lines, links, styleWords, boldLinesKeyWords));
       lines.push("</div>");
     }
-    var content = compactLines(lines).join("<br/>");
+    var content = lines.join(""); 
     var groupedNav = [];
     var currentGroup = null;
     links.forEach(function(link) {
@@ -770,7 +849,7 @@ function findSourceInfoLinkInRow(rowEl) {
     margin-bottom: 20px;
     box-sizing: border-box;
     word-wrap: break-word;
-    white-space: pre-wrap;
+    white-space: normal;
     line-height: 1.5;
   }
   h2 {
