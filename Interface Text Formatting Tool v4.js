@@ -23,10 +23,33 @@ function* allRoots(rootDoc) {
   } catch(_) {}
 }
 function pullText(el) {
-  return (el?.textContent || el?.innerText || '')
-    .replace(/\s+\n/g, '\n')
-    .replace(/\s+/g, ' ')
+  const t = (el?.textContent || el?.innerText || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\u00A0/g, ' ')          // nbsp -> space
+    .replace(/[ \t]+\n/g, '\n')       // trailing ws before newline
+    .replace(/[ \t]{2,}/g, ' ')       // collapse runs of spaces/tabs
     .trim();
+  return t;
+}
+function htmlToPlain(html) {
+  if (!html) return '';
+  let s = html;
+  s = s.replace(/\r\n/g, '\n');
+  s = s.replace(/<(?:p|div|section|article|h[1-6])\b[^>]*>/gi, '\n')
+       .replace(/<\/(?:p|div|section|article|h[1-6])>/gi, '\n');
+  s = s.replace(/<br\s*\/?>/gi, '\n');
+  s = s.replace(/<li\b[^>]*>/gi, '\n• ').replace(/<\/li>/gi, '\n');
+  s = s.replace(/<[^>]+>/g, '');
+  s = s.replace(/&nbsp;/g, ' ')
+       .replace(/&amp;/g, '&')
+       .replace(/&lt;/g, '<')
+       .replace(/&gt;/g, '>')
+       .replace(/&#10;?/g, '\n');
+  s = s.replace(/[ \t]+\n/g, '\n')
+       .replace(/\n{3,}/g, '\n\n')
+       .replace(/[ \t]{2,}/g, ' ')
+       .trim();
+  return s;
 }
 function findSourceInfosGrids() {
   const root = top?.document || document;
@@ -49,6 +72,53 @@ function findSourceInfosGrids() {
   }
   return Array.from(grids);
 }
+function findValueByLabel(labelRegex) {
+  for (const r of allRoots(top?.document || document)) {
+    try {
+      const all = Array.from(r.querySelectorAll('*'));
+      const labelNode = all.find(n => labelRegex.test((n.textContent || '').trim()));
+      if (!labelNode) continue;
+      const container = labelNode.closest('records-record-layout-item, lightning-layout, div, section') || labelNode.parentElement;
+      if (!container) continue;
+      const rich = container.querySelector('lightning-formatted-rich-text');
+      if (rich) return { type: 'rich', node: rich };
+
+      const txt = container.querySelector('lightning-base-formatted-text, lightning-formatted-text, [data-output-element-id="output-field"]');
+      if (txt) return { type: 'text', node: txt };
+    } catch (_) {}
+  }
+  return null;
+}
+async function readSourceInfoFromDetails() {
+  await ensureOnTab('Details', { timeout: 8000 });
+  const got = await waitFor(
+    () => findValueByLabel(/^\s*Source Information\s*$/i),
+    { timeout: 8000 }
+  );
+  if (!got) return { html: "", text: "" };
+  if (got.type === 'rich') {
+    const raw = got.node.innerHTML || '';
+    return { html: sanitizeRichHTML(raw), text: "" };
+  }
+  const txt = pullText(got.node);
+  return { html: "", text: txt };
+}
+async function navigateTo(href) {
+  try { 
+    const a = document.createElement('a');
+    a.href = href;
+    const want = a.href;
+    if (location.href !== want) location.assign(want);
+    else safeClick(a); // fallback
+  } catch(_) { location.assign(href); }
+  const ok = await waitFor(() => /lightning\/r\//i.test(location.href) || document.querySelector('records-record-layout-item'), { timeout: 12000 });
+  return !!ok;
+}
+async function goBackToSourceInfoTab() {
+  history.back();
+  await waitFor(() => findSourceInfosGrids().length > 0, { timeout: 12000 });
+  await ensureOnTab('Source Info') || await ensureOnTab('Source Information');
+}
 function queryDeepForLink(rootNode) {
   for (const n of allRoots(rootNode)) {
     try {
@@ -69,26 +139,32 @@ function harvestRowsFromGrid(grid) {
     dataRowCounter += 1;
     const rowIndex = Number.isFinite(ariaIdx) ? ariaIdx : dataRowCounter;
     let sourceText = '';
+    let sourceHtml = '';
     let add = null;
+    let recordHref = null;
+    const idLink = rowEl.querySelector('a[href*="/lightning/"]');
+    if (idLink) recordHref = idLink.getAttribute('href') || idLink.href || null;
     cells.forEach(td => {
       const label = (td.getAttribute('data-label') || '').trim();
       const key   = (td.getAttribute('data-col-key-value') || '').trim();
       if (/^source information$/i.test(label) || /Source_Information/i.test(key)) {
-        const rich = td.querySelector('lightning-base-formatted-text, lightning-formatted-rich-text, lightning-formatted-text, lst-basic-rich-text');
-        sourceText = pullText(rich) || pullText(td) || sourceText;
-      }
-      if (/^additional info review$/i.test(label) || /AdditionalInfoReview/i.test(key)) {
-        const a = queryDeepForLink(td); // walks shadow roots
-        if (a) {
-          add = {
-            title: (a.getAttribute('title') || a.textContent || '').trim(),
-            href: a.getAttribute('href') || '#',
-            rowIndex
-          };
+        const rich = td.querySelector('lightning-formatted-rich-text');
+        if (rich && rich.innerHTML) {
+          sourceHtml = sanitizeRichHTML(rich.innerHTML);
+        } else {
+          const txtEl = td.querySelector('lightning-base-formatted-text, lightning-formatted-text, lst-basic-rich-text');
+          const html = txtEl?.innerHTML;
+          sourceText = html ? htmlToPlain(html) : pullText(txtEl || td);
         }
       }
+      if (/^additional info review$/i.test(label) || /AdditionalInfoReview/i.test(key)) {
+        const a = queryDeepForLink(td);
+        if (a) add = { title: (a.getAttribute('title') || a.textContent || '').trim(), href: a.getAttribute('href') || '#', rowIndex };
+      }
     });
-    if (sourceText || add) rows.push({ sourceText, add, rowIndex });
+    if (sourceText || sourceHtml || add || recordHref) {
+      rows.push({ sourceText, sourceHtml, add, rowIndex, recordHref });
+    }
   });
   return rows;
 }
@@ -280,6 +356,48 @@ function getOUFromPage() {
   }
   return null;
 }
+function sanitizeRichHTML(html) {
+  if (!html) return "";
+  const allowed = new Set(["P","DIV","BR","SPAN","STRONG","B","EM","I","U","UL","OL","LI","HR"]);
+  const allowedStyleProps = new Set([
+    "font-weight","font-style","text-decoration","color","background-color"
+  ]);
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  const walk = (node) => {
+    if (node.nodeType === Node.COMMENT_NODE) { node.remove(); return; }
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const tag = node.tagName;
+      if (!allowed.has(tag)) {
+        const parent = node.parentNode;
+        while (node.firstChild) parent.insertBefore(node.firstChild, node);
+        parent.removeChild(node);
+        return;
+      }
+      for (const attr of Array.from(node.attributes)) {
+        const an = attr.name.toLowerCase();
+        const av = attr.value;
+        if (an === "style" && tag === "SPAN") {
+          const kept = [];
+          av.split(";").forEach(rule => {
+            const [k,v] = rule.split(":");
+            if (!k || !v) return;
+            const kk = k.trim().toLowerCase();
+            if (allowedStyleProps.has(kk)) kept.push(`${kk}:${v.trim()}`);
+          });
+          if (kept.length) node.setAttribute("style", kept.join(";")); else node.removeAttribute("style");
+        } else {
+          node.removeAttribute(attr.name);
+        }
+      }
+    }
+    for (const child of Array.from(node.childNodes)) walk(child);
+  };
+  walk(tpl.content);
+  return tpl.innerHTML
+    .replace(/\r\n/g, "\n")      // normalize
+    .replace(/\n{3,}/g, "\n\n"); // compact big gaps
+}
 async function getOUEnsured(){
   let ou = getOUFromPage();
   if (ou) return ou;
@@ -309,6 +427,18 @@ async function getOUEnsured(){
     });
   }
   const rows = await getRowwiseSourceInfoEnsured();
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r.recordHref) continue;
+    try {
+      const ok = await navigateTo(r.recordHref);
+      if (!ok) continue;
+      const full = await readSourceInfoFromDetails();
+      if (full.html) { r.sourceHtml = full.html; r.sourceText = ""; }
+      else if (full.text) { r.sourceText = full.text; }
+    } catch(_) {}
+    await goBackToSourceInfoTab();
+  }
   const srcRows = rows.filter(r => r.sourceText && !r.add);
   const flaggedRows = rows.filter(r => r.add && r.sourceText);
   const flaggedRowsNoSrc = rows.filter(r => r.add && !r.sourceText);
