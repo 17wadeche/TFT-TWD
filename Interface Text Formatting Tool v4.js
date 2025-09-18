@@ -73,16 +73,35 @@ function findSourceInfosGrids() {
   return Array.from(grids);
 }
 function findValueByLabel(labelRegex) {
-  for (const r of allRoots(top?.document || document)) {
+  const root = top?.document || document;
+  const getRichInnerHTML = el => {
     try {
-      const all = Array.from(r.querySelectorAll('*'));
+      const direct = el.innerHTML || "";
+      if (direct && /<\w+/i.test(direct)) return direct;
+      const sr = el.shadowRoot;
+      if (sr) {
+        const out =
+          sr.querySelector(".slds-rich-text-editor__output") ||
+          sr.querySelector("div, span");
+        if (out && out.innerHTML) return out.innerHTML;
+      }
+    } catch(_) {}
+    return el.innerHTML || "";
+  };
+  for (const r of allRoots(root)) {
+    try {
+      const all = Array.from(r.querySelectorAll("*"));
       const labelNode = all.find(n => labelRegex.test((n.textContent || '').trim()));
       if (!labelNode) continue;
       const container = labelNode.closest('records-record-layout-item, lightning-layout, div, section') || labelNode.parentElement;
       if (!container) continue;
-      const rich = container.querySelector('lightning-formatted-rich-text');
-      if (rich) return { type: 'rich', node: rich };
+      const rich =
+        container.querySelector('lightning-formatted-rich-text, lightning-output-rich-text, lightning-base-formatted-rich-text');
 
+      if (rich) {
+        const html = getRichInnerHTML(rich);
+        return { type: 'rich', node: rich, html };
+      }
       const txt = container.querySelector('lightning-base-formatted-text, lightning-formatted-text, [data-output-element-id="output-field"]');
       if (txt) return { type: 'text', node: txt };
     } catch (_) {}
@@ -90,18 +109,53 @@ function findValueByLabel(labelRegex) {
   return null;
 }
 async function readSourceInfoFromDetails() {
-  await ensureOnTab('Details', { timeout: 8000 });
-  const got = await waitFor(
-    () => findValueByLabel(/^\s*Source Information\s*$/i),
-    { timeout: 8000 }
+  await ensureOnTab('Details', { timeout: 10000 });
+  const labeled = await waitFor(
+    () => findValueByLabel(/^\s*Source\s*Information\s*$/i),
+    { timeout: 6000 }
   );
-  if (!got) return { html: "", text: "" };
-  if (got.type === 'rich') {
-    const raw = got.node.innerHTML || '';
-    return { html: sanitizeRichHTML(raw), text: "" };
+  if (labeled) {
+    if (labeled.type === 'rich') {
+      const raw = labeled.html || labeled.node.innerHTML || '';
+      return { html: sanitizeRichHTML(raw), text: "" };
+    } else {
+      return { html: "", text: pullText(labeled.node) };
+    }
   }
-  const txt = pullText(got.node);
-  return { html: "", text: txt };
+  const root = top?.document || document;
+  const tryGetInner = (el) => {
+    try {
+      if (!el) return '';
+      if (el.innerHTML && /<\w+/i.test(el.innerHTML)) return el.innerHTML;
+      if (el.shadowRoot) {
+        const out =
+          el.shadowRoot.querySelector('.slds-rich-text-editor__output') ||
+          el.shadowRoot.querySelector('div, span');
+        if (out && out.innerHTML) return out.innerHTML;
+      }
+    } catch(_) {}
+    return el?.innerHTML || '';
+  };
+  for (const r of allRoots(root)) {
+    try {
+      const container = r.querySelector('records-record-layout-item, records-highlights-details, forcegenerated-adg-rollup_component__recordlayout2');
+      if (!container) continue;
+      const rich = container.querySelector(
+        'lightning-formatted-rich-text, lightning-output-rich-text, lightning-base-formatted-rich-text'
+      );
+      if (rich) {
+        const raw = tryGetInner(rich);
+        if (raw) return { html: sanitizeRichHTML(raw), text: "" };
+      }
+    } catch(_) {}
+  }
+  for (const r of allRoots(root)) {
+    try {
+      const txt = r.querySelector('lightning-base-formatted-text, lightning-formatted-text, [data-output-element-id="output-field"]');
+      if (txt) return { html: "", text: pullText(txt) };
+    } catch(_) {}
+  }
+  return { html: "", text: "" };
 }
 async function navigateTo(href) {
   try { 
@@ -142,13 +196,14 @@ function harvestRowsFromGrid(grid) {
     let sourceHtml = '';
     let add = null;
     let recordHref = null;
-    const idLink = rowEl.querySelector('a[href*="/lightning/"]');
-    if (idLink) recordHref = idLink.getAttribute('href') || idLink.href || null;
+    recordHref = findSourceInfoLinkInRow(rowEl);
     cells.forEach(td => {
       const label = (td.getAttribute('data-label') || '').trim();
       const key   = (td.getAttribute('data-col-key-value') || '').trim();
       if (/^source information$/i.test(label) || /Source_Information/i.test(key)) {
-        const rich = td.querySelector('lightning-formatted-rich-text');
+        const rich = td.querySelector(
+          'lightning-formatted-rich-text, lightning-output-rich-text, lightning-base-formatted-rich-text'
+        );
         if (rich && rich.innerHTML) {
           sourceHtml = sanitizeRichHTML(rich.innerHTML);
         } else {
@@ -458,6 +513,16 @@ async function getOUEnsured(){
   if (!onDetails) return null;
   ou = await waitFor(() => getOUFromPage(), {timeout: 5000});
   return ou || null;
+}
+function findSourceInfoLinkInRow(rowEl) {
+  const allAs = Array.from(rowEl.querySelectorAll('a[href]'));
+  const byText = allAs.find(a => /SourceInfo-\d{3,}/i.test((a.textContent || '').trim()));
+  if (byText) return byText.getAttribute('href') || byText.href;
+  const byPrefix = allAs.find(a => /\/lightning\/r\/a5A\w+\/view/i.test(a.getAttribute('href') || a.href || ''));
+  if (byPrefix) return byPrefix.getAttribute('href') || byPrefix.href;
+  const byHoverable = rowEl.querySelector('records-hoverable-link a[href]');
+  if (byHoverable) return byHoverable.getAttribute('href') || byHoverable.href;
+  return null;
 }
 (async function run() {
   const tab = openTabEarly();
